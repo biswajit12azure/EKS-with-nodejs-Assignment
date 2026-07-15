@@ -1,0 +1,95 @@
+// CI Pipeline -- Build, Test, Docker Build & Push to ECR
+// Required Jenkins credentials:
+//   aws-credentials  -> AWS Access Key ID + Secret (type: AWS Credentials)
+// Required env vars:
+//   AWS_ACCOUNT_ID, AWS_REGION, ECR_REPO_NAME
+
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_TAG       = "${env.GIT_COMMIT[0..7]}"
+        ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        IMAGE_FULL_NAME = "${ECR_REGISTRY}/${ECR_REPO_NAME}:${IMAGE_TAG}"
+        IMAGE_LATEST    = "${ECR_REGISTRY}/${ECR_REPO_NAME}:latest"
+    }
+
+    options {
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+                echo "Branch: ${env.BRANCH_NAME} | Commit: ${env.GIT_COMMIT}"
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                dir('app-deployment-assignment/app') {
+                    sh 'npm ci'
+                }
+            }
+        }
+
+        stage('Run Tests') {
+            steps {
+                dir('app-deployment-assignment/app') {
+                    sh 'npm test'
+                }
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true,
+                          testResults: 'app-deployment-assignment/app/coverage/junit.xml'
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                dir('app-deployment-assignment') {
+                    sh "docker build -t ${IMAGE_FULL_NAME} -t ${IMAGE_LATEST} ."
+                }
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                withCredentials([[
+                    $class:            'AmazonWebServicesCredentialsBinding',
+                    credentialsId:     'aws-credentials',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh '''
+                        aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+                        aws ecr describe-repositories --repository-names $ECR_REPO_NAME --region $AWS_REGION || aws ecr create-repository --repository-name $ECR_REPO_NAME --region $AWS_REGION --image-scanning-configuration scanOnPush=true
+                        docker push $IMAGE_FULL_NAME
+                        docker push $IMAGE_LATEST
+                    '''
+                }
+            }
+        }
+
+    }
+
+    post {
+        success {
+            echo "CI complete. Image pushed: ${IMAGE_FULL_NAME}"
+            writeFile file: 'image_tag.txt', text: "${IMAGE_TAG}"
+            archiveArtifacts artifacts: 'image_tag.txt'
+        }
+        failure {
+            echo "CI pipeline failed. See console output above."
+        }
+        always {
+            sh "docker rmi ${IMAGE_FULL_NAME} ${IMAGE_LATEST} || true"
+        }
+    }
+}

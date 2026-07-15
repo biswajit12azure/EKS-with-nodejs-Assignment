@@ -1,0 +1,159 @@
+// CD Pipeline -- Deploy to EKS using kubectl
+// Triggered manually or chained from Jenkinsfile-CI via IMAGE_TAG parameter.
+// Required Jenkins credentials:
+//   aws-credentials   -> AWS Access Key ID + Secret (type: AWS Credentials)
+// Required env vars:
+//   AWS_ACCOUNT_ID, AWS_REGION, ECR_REPO_NAME, EKS_CLUSTER_NAME, K8S_NAMESPACE
+
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name:         'IMAGE_TAG',
+            defaultValue: 'latest',
+            description:  'Docker image tag to deploy (short commit SHA from CI pipeline)'
+        )
+    }
+
+    environment {
+        ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        IMAGE_FULL_NAME = "${ECR_REGISTRY}/${ECR_REPO_NAME}:${params.IMAGE_TAG}"
+    }
+
+    options {
+        timestamps()
+        timeout(time: 20, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Configure kubectl') {
+            steps {
+                withCredentials([[
+                    $class:            'AmazonWebServicesCredentialsBinding',
+                    credentialsId:     'aws-credentials',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh '''
+                        aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
+                        kubectl cluster-info
+                    '''
+                }
+            }
+        }
+
+        stage('Update Image in Manifest') {
+            steps {
+                dir('app-deployment-assignment/k8s') {
+                    sh '''
+                        sed -i "s|ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com|$ECR_REGISTRY|g" deployment.yaml
+                        sed -i "s|hello-world-api:latest|$ECR_REPO_NAME:$IMAGE_TAG|g" deployment.yaml
+                    '''
+                }
+            }
+        }
+
+        stage('Apply Kubernetes Manifests') {
+            steps {
+                withCredentials([[
+                    $class:            'AmazonWebServicesCredentialsBinding',
+                    credentialsId:     'aws-credentials',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    dir('app-deployment-assignment/k8s') {
+                        sh '''
+                            kubectl apply -f deployment.yaml -n $K8S_NAMESPACE
+                            kubectl apply -f service.yaml    -n $K8S_NAMESPACE
+                            kubectl apply -f ingress.yaml    -n $K8S_NAMESPACE
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Verify Rollout') {
+            steps {
+                withCredentials([[
+                    $class:            'AmazonWebServicesCredentialsBinding',
+                    credentialsId:     'aws-credentials',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh '''
+                        kubectl rollout status deployment/hello-world-api -n $K8S_NAMESPACE --timeout=180s
+                        echo '--- Pods ---'
+                        kubectl get pods -n $K8S_NAMESPACE -l app=hello-world-api
+                        echo '--- Ingress (ALB DNS) ---'
+                        kubectl get ingress hello-world-api -n $K8S_NAMESPACE
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke Test') {
+            steps {
+                withCredentials([[
+                    $class:            'AmazonWebServicesCredentialsBinding',
+                    credentialsId:     'aws-credentials',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    script {
+                        def albDns = sh(
+                            script: "kubectl get ingress hello-world-api -n ${K8S_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'",
+                            returnStdout: true
+                        ).trim()
+
+                        if (!albDns) {
+                            error('ALB DNS not yet assigned - ingress may still be provisioning')
+                        }
+
+                        echo "ALB endpoint: http://${albDns}"
+
+                        sh """
+                            for i in \$(seq 1 18); do
+                                HTTP_CODE=\$(curl -s -o /dev/null -w '%{http_code}' http://${albDns}/health || true)
+                                if [ "\$HTTP_CODE" = "200" ]; then
+                                    echo "Smoke test passed (HTTP 200)"
+                                    exit 0
+                                fi
+                                echo "Attempt \$i: HTTP \$HTTP_CODE - retrying in 10s..."
+                                sleep 10
+                            done
+                            echo "Smoke test failed after 3 minutes"
+                            exit 1
+                        """
+                    }
+                }
+            }
+        }
+
+    }
+
+    post {
+        success {
+            echo "Deployment of ${IMAGE_FULL_NAME} to ${EKS_CLUSTER_NAME} succeeded."
+        }
+        failure {
+            echo "CD pipeline failed - rolling back deployment."
+            withCredentials([[
+                $class:            'AmazonWebServicesCredentialsBinding',
+                credentialsId:     'aws-credentials',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ]]) {
+                sh "kubectl rollout undo deployment/hello-world-api -n ${K8S_NAMESPACE} || true"
+            }
+        }
+    }
+}

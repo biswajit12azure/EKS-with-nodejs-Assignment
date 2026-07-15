@@ -1,0 +1,8 @@
+app/node_modules
+app/coverage
+**/*.log
+.git
+.gitignore
+k8s/
+jenkins/
+README.md
